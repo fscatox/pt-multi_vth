@@ -1,6 +1,6 @@
 # File              : multiVth.tcl
 # Author            : Fabio Scatozza <s315216@studenti.polito.it>
-# Date              : 22.06.2024
+# Date              : 23.06.2024
 
 ## @brief Collects technology library specific definitions
 
@@ -116,16 +116,13 @@ proc getVtAlternative {lib_from ref_name {step 1}} {
 #   This last operation triggers a computationally expensive power update,
 #   thus should be executed only once all swaps have already been committed:
 #   this implementation triggers as many updates as the possible Vt options.
-#
-# @param args The option `-fast` is devised to comply with contest runtime
-# constraints. It restricts the analysis to all cells at the lowest Vt option.
 
-proc initLeakagePowerLut {args} {
+proc initLeakagePowerLut {} {
   variable ::STcmos65::VT_ALIAS_ENUM
   variable ::STcmos65::LKG_LUT
 
-  # depending on the option, select all cells not already at highest Vt or all those at lowest Vt
-  set filter_expr "lib_cell.threshold_voltage_group [expr {$args == {-fast} ? "== [lindex $VT_ALIAS_ENUM 0]" : "!= [lindex $VT_ALIAS_ENUM end]" }]"
+  # select all cells not already at highest Vt
+  set filter_expr "lib_cell.threshold_voltage_group != [lindex $VT_ALIAS_ENUM end]"
   set swappable_cells [get_cells -quiet -filter $filter_expr]
   set full_names [get_attribute $swappable_cells lib_cell.full_name]
 
@@ -156,9 +153,6 @@ proc initLeakagePowerLut {args} {
     }
 
     # look for cells that are still swappable
-    if {$args == {-fast}} {
-      break
-    }
     set swappable_cells [filter_collection $swappable_cells[set swappable_cells {}] $filter_expr]
     set full_names [get_attribute $swappable_cells lib_cell.full_name]
   }
@@ -189,7 +183,7 @@ proc initLeakagePowerLut {args} {
 #
 # @return {cost lib_name ref_name base_name cell}* sorted by increasing cost
 
-proc rankCellsLocalSlackLkg {} {
+proc rankCellsLocal {} {
   variable ::STcmos65::VT_ALIAS_ENUM
   variable ::STcmos65::LKG_LUT
 
@@ -219,37 +213,6 @@ proc rankCellsLocalSlackLkg {} {
 ##
 # @brief Generates a list of candidate cells to swap to higher Vt
 #
-# Compared to rankCellsLocalSlackLkg(), it's specifically optimized for speed.
-# The cell under analysis are all those at the lowest Vt option, for which
-# the cost is computed accounting only for slack availability.
-#
-# @return {cost lib_name ref_name base_name cell}* sorted by increasing cost
-
-proc rankCellsLocalSlackFast {} {
-  variable ::STcmos65::VT_ALIAS_ENUM
-
-  # restrict candidates to all cells at lowest Vt
-  set swappable_cells [get_cells -quiet -filter "lib_cell.threshold_voltage_group == [lindex $VT_ALIAS_ENUM 0]"]
-  set full_names [get_attribute $swappable_cells lib_cell.full_name]
-
-  set idx 0
-  set ranking {}
-
-  foreach_in_collection cell $swappable_cells {
-    lassign [split [lindex $full_names $idx] /] lib_name ref_name
-
-    set slack [lmin [get_attribute [get_pins -of_objects $cell] max_slack]]
-    lappend ranking $slack $lib_name $ref_name {} $cell
-    incr idx
-  }
-
-  # the cost function rewards high slack availability: minimum cost <=> highest slack
-  return [lsort -real -decreasing -stride 5 $ranking]
-}
-
-##
-# @brief Generates a list of candidate cells to swap to higher Vt
-#
 # The assumption is that the design is not violating timing constraints.
 # All cells not already at highest Vt are sorted by increasing cost, where
 # the cost function rewards:
@@ -268,18 +231,14 @@ proc rankCellsLocalSlackFast {} {
 # 2012 Design, Automation & Test in Europe Conference & Exhibition (DATE),
 # Dresden, Germany, 2012, pp. 99-104, doi: 10.1109/DATE.2012.6176440.
 #
-# @param args The option `-fast` is devised to comply with contest runtime
-# constraints. It restricts the analysis to all cells at the lowest Vt option.
 # @return {cost lib_name ref_name base_name cell}* sorted by increasing cost
 
-proc rankCellsGlobal {args} {
+proc rankCellsGlobal {} {
   variable ::STcmos65::VT_ALIAS_ENUM
   variable ::STcmos65::LKG_LUT
 
-  # depending on the option, select all cells not already at highest Vt or all those at lowest Vt
-  set filter_expr "lib_cell.threshold_voltage_group [expr {$args == {-fast} ? "== [lindex $VT_ALIAS_ENUM 0]" : "!= [lindex $VT_ALIAS_ENUM end]" }]"
-  set swappable_cells [get_cells -quiet -filter $filter_expr]
-
+  # select all cells not already at highest Vt
+  set swappable_cells [get_cells -quiet -filter "lib_cell.threshold_voltage_group != [lindex $VT_ALIAS_ENUM end]"]
   set base_names [get_attribute $swappable_cells base_name]
   set full_names [get_attribute $swappable_cells lib_cell.full_name]
 
@@ -325,32 +284,28 @@ proc swapCells {ranking} {
 }
 
 ##
-# @brief Performs the Vt assignment to locally optimize leakage power
+# @brief Performs the Vt assignment based on rankCellsLocal()
 #
-# The local nature of the optimization comes from the ranking functions,
-# which don't account for the effects of the swap on the whole design.
-#
-# @param ranking_function `rankCellsLocalSlackLkg` or `rankCellsLocalSlackFast`
 # @param select_pct The percentage of candidates cells to wholesale swap
-# @param derate_pct Once the wholesale swap of the candidates has failed,
-# the percentage of those cells to re-attempt swapping
+# @param derate_pct Once the wholesale swap has failed, the percentage
+# of those cells to re-attempt swapping
 #
-# @note After the swap, an incremental timing update is not sufficitently
+# @note After the swap, an incremental timing update is not sufficiently
 # accurate to ensure the optimization loop ends with the design compliant
 # with timing constraints.
 
-proc localOptimization {ranking_function select_pct derate_pct} {
+proc localOptimization {select_pct derate_pct} {
 
   # generate ranking
-  set ranking [$ranking_function]
+  set ranking [rankCellsLocal]
   set n_swappable [expr {[llength $ranking]/5}]
   set n_toswap [expr {int(ceil($n_swappable*$select_pct))}]
-  dputs "(localOptimization <$ranking_function>) Swapping $n_toswap ..."
 
   # if there are candidates to swap
   while {$n_toswap > 0} {
 
     # swap them
+    dputs "(localOptimization) Swapping $n_toswap ..."
     set undo_list [swapCells [lrange $ranking 0 [expr {$n_toswap*5-1}]]]
     update_timing -full
 
@@ -359,10 +314,9 @@ proc localOptimization {ranking_function select_pct derate_pct} {
 
       # prepare next swap
       # stop condition: n_swappable = 0
-      set ranking [$ranking_function]
+      set ranking [rankCellsLocal]
       set n_swappable [expr {[llength $ranking]/5}]
       set n_toswap [expr {int(ceil($n_swappable*$select_pct))}]
-      dputs "(localOptimization <$ranking_function>) Swapping $n_toswap ..."
 
     } else {
 
@@ -374,48 +328,27 @@ proc localOptimization {ranking_function select_pct derate_pct} {
       # and attempt a finer selection
       # stop condition: n_toswap --> 0
       set n_toswap [expr {int(floor($n_toswap*$derate_pct))}]
-      dputs "(localOptimization <$ranking_function>) Violation detected. Attempting with $n_toswap ..."
+      dputs "(localOptimization) Timing violation. Attempting with $n_toswap ..."
     }
   }
-
 }
 
 ##
-# @brief Performs the Vt assignment to globally optimize leakage power
-#
-# The global nature of the optimization comes from the ranking function,
-# which performs "what if" analyses to account for the effects of the swaps
-# on the whole design.
+# @brief Performs the Vt assignment based on rankCellsGlobal()
 #
 # Given the contest runtime constraints, the optimization loop is time-aware.
 # The duration of the iterations is tracked with an exponential moving average,
 # to predict whether the subsequent iteration would complete in time.
 #
-# @param args Syntax: ?-fast? start_time_ms max_time_ms select_n
-#
-#   -fast If present, the option is passed to the ranking function to restrict
-# the analysis to all cells at the lowest Vt option. In addition, it disables
-# checking for locksteps in which the same cell is ranked as eligible for a swap
-# (because of the lower accuracy of incremental timing updates), but then it
-# generates a timing violation after applying the swap.
-#
-#   select_n The number of cells to wholesale swap (>= 1).
-#
-#   start_time_ms The time (count of milliseconds since epoch) when the
+# @param start_time_ms The time (count of milliseconds since epoch) when the
 # optimization started.
-#
-#   max_time_ms The maximum runtime in milliseconds for the optimization.
+# @param max_runtime_ms The maximum runtime in milliseconds for the optimization.
 #
 # @note After the swap, an incremental timing update is not sufficitently
 # accurate to ensure the optimization loop ends with the design compliant
 # with timing constraints.
 
-proc globalOptimization {args} {
-  if {[llength $args] == 4} {
-    lassign $args opt select_n start_time_ms max_time_ms
-  } else {
-    lassign $args select_n start_time_ms max_time_ms opt
-  }
+proc globalOptimization {start_time_ms max_runtime_ms} {
 
   # exponential moving average initialization
   set dt {}
@@ -423,88 +356,59 @@ proc globalOptimization {args} {
 
   # generate ranking
   set t0 [clock milliseconds]
-  set ranking [rankCellsGlobal $opt]
+  set ranking [rankCellsGlobal]
   set n_swappable [expr {[llength $ranking]/5}]
 
   # as long as there are candidates
   while {$n_swappable > 0} {
-    dputs "(globalOptimization) $n_swappable candidates found ..."
-
-    # swap as many as possible, selecting select_n at a time in the first attempt
-    set swap_size $select_n
-    set n 0
-    while {1} {
-
-      set violation 0
-      for {} {$n < $n_swappable} {incr n $swap_size} {
-        dputs "(globalOptimization) Swapping [expr {min($n+$swap_size, $n_swappable+1)-$n}] at a time, from $n ([expr {$n*5}])..."
-        set undo_list [swapCells [lrange $ranking [expr {$n*5}] [expr {min($n+$swap_size, $n_swappable+1)*5-1}]]]
-        update_timing -full
-
-        # if there is a violation, unswap the last batch
-        if {[get_attribute [get_timing_paths] slack] < 0} {
-          dputs "(globalOptimization) Unswapping [expr {[llength $undo_list]/2}] ..."
-          foreach {cell full_name_to} $undo_list {
-            size_cell $cell $full_name_to
-          }
-          # and try with a smaller swap_size
-          incr violation
-          incr swap_size -1
-          break
-        }
+    
+    # swap as many as possible
+    set n_skipped 0
+    foreach {- lib_name ref_name - cell} $ranking {
+      size_cell $cell [getVtAlternative $lib_name $ref_name]
+      update_timing -full
+      if {[get_attribute [get_timing_paths] slack] < 0} {
+        size_cell $cell $lib_name/$ref_name
+        incr n_skipped
       }
-
-      # until all is done with no violation, or there is no new swap_size to try
-      if {!$violation || $swap_size == 0} {dputs "(globalOptimization) Done: n = $n ..."; break}
-      dputs "(globalOptimization) Restarting from $n ([expr {$n*5}]), $swap_size at a time ..."
     }
+    dputs "(globalOptimization) Swapped [expr {$n_swappable-$n_skipped}] out of $n_swappable ..."
 
-    # update the average iteration duration and check if there's time for one more
+    # update the average iteration duration
     set t1 [clock milliseconds]
     set dt [expr {$dt == {} ? $t1-$t0 : $alpha*($t1-$t0)+(1-$alpha)*$dt}]
-    dputs "(globalOptimization) @ $t1: dt = $dt"
-    if {$t1 + $dt >= $start_time_ms + $max_time_ms} {
+    dputs "(globalOptimization) dt = $dt"
+
+    # and check if there's time for one more iteration
+    if {$t1 + $dt >= $start_time_ms + $max_runtime_ms} {
       dputs "(globalOptimization) Time is up ..."
       break
     }
 
-    # if there is time, prepare the new iteration
+    # prepare the new iteration
     set t0 [clock milliseconds]
     set prev_ranking $ranking
-    set ranking [rankCellsGlobal $opt]
+    set ranking [rankCellsGlobal]
     set n_swappable [expr {[llength $ranking]/5}]
 
-    # if not in fast mode, check that the candidate cells are different to prevent locksteps
-    if {$opt != {-fast} && ([llength $ranking] == [llength $prev_ranking]) &&
-    ([lmap {- - - base_name -} $ranking {set base_name}] == [lmap {- - - base_name -} $prev_ranking {set base_name}])} {
+    # check that the candidate cells are different to prevent locksteps
+    if {([llength $ranking] == [llength $prev_ranking]) &&
+        ([lmap {- - - base_name -} $ranking {set base_name}] == [lmap {- - - base_name -} $prev_ranking {set base_name}])} {
       dputs "(globalOptimization) Lockstep. Aborting ..."
       break
     }
   }
-
 }
 
-
-##
-# @brief The full optimization recipe
-#
-# The parameters of the optimization commands result from tests
-# on the contest benchmark circuits (c1908, c5315)
+## @brief The full optimization recipe
 
 proc multiVth {} {
 
   set start_time_ms [clock milliseconds]
-  set n_cells [sizeof_collection [get_cells]]
 
-  if {$n_cells > 300 && [get_attribute [get_timing_paths] slack] < .001} {
-    initLeakagePowerLut -fast
-    localOptimization rankCellsLocalSlackFast [expr {68.0/$n_cells}] 0
-    globalOptimization -fast 4 $start_time_ms 180000
-  } else {
-    initLeakagePowerLut
-    localOptimization rankCellsLocalSlackLkg 1 .95
-    globalOptimization 4 $start_time_ms 180000
-  }
+  initLeakagePowerLut
+  localOptimization .5 .9
+  globalOptimization $start_time_ms 180000
 
 }
 
@@ -512,6 +416,5 @@ proc multiVth {} {
 # @brief DEBUG SUPPORT
 #
 # Select one to enable/disable debug messages
-
 #proc dputs args {puts stderr $args}
 proc dputs args {}
