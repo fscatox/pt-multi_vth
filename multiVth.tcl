@@ -391,10 +391,10 @@ proc globalOptimization {start_time_ms max_runtime_ms} {
     set ranking [rankCellsGlobal]
     set n_swappable [expr {[llength $ranking]/5}]
 
-    # check that the candidate cells are different to prevent locksteps
+    # check that the candidate cells are different
     if {([llength $ranking] == [llength $prev_ranking]) &&
         ([lmap {- - - base_name -} $ranking {set base_name}] == [lmap {- - - base_name -} $prev_ranking {set base_name}])} {
-      dputs "(globalOptimization) Lockstep. Aborting ..."
+      dputs "(globalOptimization) Aborting early ..."
       break
     }
   }
